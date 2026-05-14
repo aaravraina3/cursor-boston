@@ -92,6 +92,7 @@ def imports():
     import pandas as pd
     import plotly.express as px
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
     import pyarrow as pa
     import pyarrow.lib as palib
     import torch
@@ -148,6 +149,7 @@ def imports():
         hf_hub_download,
         io,
         load_file,
+        make_subplots,
         mo,
         nn,
         np,
@@ -676,6 +678,10 @@ def sec_b_data(
     time,
     torch,
 ):
+    # Slow cell (~40s). For each of 24 sampled frames in episode 0, run both
+    # the MLP draft and a fresh diffusion call, recording predicted actions,
+    # latencies, and MSE vs the recorded human action. Downstream tau sweeps
+    # read this DataFrame -- only this cell pays the inference cost.
     _N_SPEC = 24
     _spec_frame_indices = list(range(0, 144, 6))
 
@@ -729,6 +735,10 @@ def sec_b_data(
 
 @app.cell(hide_code=True)
 def sec_b_sweep(diffusion_n_action_steps, np, pd, spec_data_df):
+    # Pure-Python analytical sweep over the acceptance threshold tau. No
+    # inference here -- everything is derived from spec_data_df, including
+    # the two latency models (naive: pay diff every reject; chunked: amortize
+    # diff over n_action_steps).
     _deltas = spec_data_df["delta"].values
     _mlp_mses = spec_data_df["mlp_mse"].values
     _diff_mses = spec_data_df["diff_mse"].values
@@ -781,13 +791,12 @@ def sec_b_sweep(diffusion_n_action_steps, np, pd, spec_data_df):
 @app.cell(hide_code=True)
 def sec_b_plot(
     go,
+    make_subplots,
     spec_baseline_diff_lat_per_frame_chunked,
     spec_baseline_diff_mse,
     spec_baseline_mlp_mse,
     spec_sweep_df,
 ):
-    from plotly.subplots import make_subplots
-
     _fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         subplot_titles=(
@@ -847,7 +856,7 @@ def sec_b_plot(
                        title="Speculative decoding for robot policies — the tau sweep")
     _fig
 
-    return (make_subplots,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -1017,6 +1026,10 @@ def sec_c_compute(
     steps_pred_cache,
     torch,
 ):
+    # Adaptive denoising baseline. Reuses cached predictions from the
+    # Section A step sweep -- no extra inference. The 'thr' knob decides
+    # per-frame whether to upgrade to high_steps based on the MLP/low-steps
+    # disagreement.
     # Use the calibration frames (8 of them, every 3rd from frame 0..23) and the
     # cached predictions at each step count.
     _calib_frames = list(range(0, 24, 3))
@@ -1137,6 +1150,10 @@ def sec_f_compute(
     time,
     torch,
 ):
+    # Cross-episode validation. Re-runs the speculative measurement on
+    # episodes 1 and 2 with the same 24-frame schedule, then picks the
+    # smallest tau on each episode that hits the deadline (simple grid).
+    # Slow: ~70s of CPU diffusion across two episodes.
     def _load_episode_frames(_ep_idx, _max_frames=None):
         _meta = dataset.meta.episodes[_ep_idx]
         _f = int(_meta["dataset_from_index"])
@@ -1329,6 +1346,11 @@ def sec_d_boot_compute(
     pd,
     spec_multi_per_ep_data,
 ):
+    # Bootstrap CI on the pooled 72-frame set (24 frames x 3 episodes).
+    # tau is chosen once on the full pool, then 1000 resamples of frames
+    # (with replacement) give a distribution of speedup / latency / acceptance
+    # AT THAT FIXED TAU -- so the CI reflects per-frame sampling variance,
+    # not tau-tuning variance.
     _frames = []
     for _ep, _df in spec_multi_per_ep_data.items():
         _df2 = _df.copy()
